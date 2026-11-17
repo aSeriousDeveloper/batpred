@@ -2526,6 +2526,8 @@ class Fetch:
         iog_slot_cars = []
         # The planned dispatches each car's plan used this cycle, for octopus_held_update()
         self.octopus_slots_planned = {}
+        # Read below once the dispatches are in; none without Octopus Intelligent slots
+        self.octopus_cap_idle = None
 
         if entity_id_list:
             # Process each car's intelligent slot configuration
@@ -2684,6 +2686,10 @@ class Fetch:
             # Get rate for import to compute charging costs
             if self.rate_import:
                 self.rate_scan(self.rate_import, print=False)
+
+            # The past minutes no car charged in, which use none of the Octopus Intelligent daily cap (#6252): read once
+            # every car's dispatches are in, before the car plans below and the rates count the cap with them
+            self.octopus_cap_idle = self.octopus_cap_idle_load()
 
             # Use octopus slots for charging - process for each car
             if self.octopus_intelligent_charging:

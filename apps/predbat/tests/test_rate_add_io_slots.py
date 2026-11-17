@@ -649,6 +649,7 @@ def run_rate_add_io_slots_cases(my_predbat):
     failed |= run_rate_add_io_slots_flag_tests(my_predbat, midnight_utc, TIME_FORMAT)
     failed |= run_rate_add_io_slots_log_test(my_predbat, midnight_utc, TIME_FORMAT)
     failed |= run_cap_minutes_tests(my_predbat, midnight_utc, TIME_FORMAT)
+    failed |= run_cap_actual_charging_tests(my_predbat, midnight_utc, TIME_FORMAT)
     failed |= run_shared_cap_tests(my_predbat, midnight_utc, TIME_FORMAT)
     failed |= run_rate_add_io_short_slot_tests(my_predbat, midnight_utc, TIME_FORMAT)
     return failed
@@ -800,6 +801,219 @@ def run_cap_minutes_tests(my_predbat, midnight_utc, time_format):
     finally:
         for key, value in saved.items():
             setattr(my_predbat, key, value)
+
+    return failed
+
+
+def car_energy_records(midnight_utc, time_format, charging_minutes, kw=7.2, first_minute=-24 * 60, resets=()):
+    """
+    Home Assistant history records for a cumulative car energy sensor, oldest first: one at first_minute (minutes past
+    midnight) and then one every 5 seconds while it rises, with the car charging at kw in each of charging_minutes, as a
+    sensor that records each small change does. It drops back to zero at each minute in resets.
+    """
+    records = []
+    total = 0.0
+
+    def record(minute):
+        """Add a record of the sensor's value at the given minute"""
+        stamp = (midnight_utc + timedelta(minutes=minute)).strftime(time_format)
+        records.append({"state": str(round(total, 4)), "last_updated": stamp, "attributes": {"unit_of_measurement": "kWh"}})
+
+    record(first_minute)
+    for minute in range(first_minute, 24 * 60):
+        if minute in resets:
+            total = 0.0
+            record(minute)
+        if minute in charging_minutes:
+            for seconds in range(5, 65, 5):
+                total += kw / 720.0
+                record(minute + seconds / 60.0)
+    return records
+
+
+def run_cap_actual_charging_tests(my_predbat, midnight_utc, time_format):
+    """
+    Octopus counts the time the car actually charged towards the daily cap ("the actual amount of time the car is charged
+    for is what's counted towards the 6 hour cap"), but reports completed dispatches in whole half hours. With a
+    car_charging_energy sensor for every car, a past minute no car charged in uses none of the cap (#6252).
+
+    Now is 10:00, so everything here from midnight to midday shares one midday-to-midday budget. Each car's history is
+    read by octopus_cap_idle_load() from raw Home Assistant records, as fetch_sensor_data() reads it.
+    """
+    failed = False
+    saved = {key: getattr(my_predbat, key) for key in ("num_cars", "car_charging_soc", "car_charging_limit", "car_charging_loss", "rate_max_base", "now_utc", "octopus_cap_idle", "octopus_slots")}
+    saved_scale = my_predbat.__dict__.get("car_charging_energy_scale")
+    saved_arg = my_predbat.args.get("car_charging_energy")
+    my_predbat.num_cars = 1
+    my_predbat.car_charging_soc = [0.0]
+    my_predbat.car_charging_limit = [100.0]
+    my_predbat.car_charging_loss = 1.0
+    my_predbat.rate_max_base = 10
+    my_predbat.car_charging_energy_scale = 1.0
+    minutes_now = my_predbat.minutes_now
+    my_predbat.now_utc = midnight_utc + timedelta(minutes=minutes_now)
+    histories = {}
+    my_predbat.get_history_wrapper = lambda entity_id, days=30, required=True, tracked=True: [histories.get(entity_id, [])]
+
+    def dispatch(start, end, kwh=2.0):
+        """A smart-charge dispatch at home between two (hour, minute) times today"""
+        start_time = midnight_utc + timedelta(hours=start[0], minutes=start[1])
+        end_time = midnight_utc + timedelta(hours=end[0], minutes=end[1])
+        return {"start": start_time.strftime(time_format), "end": end_time.strftime(time_format), "charge_in_kwh": kwh, "source": "smart-charge", "location": "AT_HOME"}
+
+    def rates_for(*spans):
+        """Expected rates from (start, end, rate) spans of minutes"""
+        return {minute: rate for start, end, rate in spans for minute in range(start, end)}
+
+    def set_energy(*cars, slot_cars=None, **kwargs):
+        """
+        Give each car a car_charging_energy sensor charging in the given minutes (None: a sensor with no history), and load
+        the idle minutes. Every car has Octopus Intelligent dispatches, or only those in slot_cars
+        """
+        histories.clear()
+        my_predbat.octopus_slots = [["dispatch"] if slot_cars is None or car_n in slot_cars else [] for car_n in range(max(my_predbat.num_cars, 1))]
+        entities = []
+        for car_n, charging_minutes in enumerate(cars):
+            entity_id = "sensor.car_energy_{}".format(car_n)
+            entities.append(entity_id)
+            if charging_minutes is not None:
+                histories[entity_id] = car_energy_records(midnight_utc, time_format, set(charging_minutes), **kwargs)
+        if entities:
+            my_predbat.args["car_charging_energy"] = entities if len(entities) > 1 else entities[0]
+        else:
+            my_predbat.args.pop("car_charging_energy", None)
+        my_predbat.octopus_cap_idle = my_predbat.octopus_cap_idle_load()
+
+    def check_idle(testname, expected_idle, expected_busy):
+        """Check minutes the loaded history should, and should not, give as idle"""
+        idle = my_predbat.octopus_cap_idle or set()
+        wrong = [minute for minute in expected_idle if minute not in idle] + [minute for minute in expected_busy if minute in idle]
+        if wrong:
+            print("ERROR: {} minutes {} are wrongly idle or not".format(testname, wrong))
+            return True
+        return False
+
+    # A later charge at 09:20 gives the sensor a record after the dispatches below, so the minutes before it are known
+    later = list(range(560, 562))
+    try:
+        # A completed half hour, 08:00-08:30, the car charged the first 10 minutes of: it uses 10 minutes of a 30-minute
+        # cap, so the 20 minutes planned at 10:30 still fit and only the 10 at 11:00 are over the cap
+        slots = [dispatch((8, 0), (8, 30)), dispatch((10, 30), (10, 50)), dispatch((11, 0), (11, 10))]
+        print("\n**** Cap actual charging: a completed half hour charged for 10 minutes ****")
+        set_energy(list(range(480, 490)) + later)
+        failed |= check_idle("cap_actual_ten_minutes", range(490, 558), list(range(480, 490)) + later + list(range(minutes_now, minutes_now + 30)))
+        failed |= run_cap_minutes_case("cap_actual_ten_minutes", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 660, 4.0), (660, 690, 10.0)), [(630, 650, 4), (660, 670, 10)])
+
+        # Without a car energy sensor the whole half hour is counted, as before, so everything after it is over the cap
+        print("\n**** Cap actual charging: no car energy sensor ****")
+        set_energy()
+        failed |= run_cap_minutes_case("cap_actual_no_sensor", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 690, 10.0)), [(630, 650, 10), (660, 670, 10)])
+
+        # Nothing after the last record says the car stopped (the sensor may just not have updated), so with no later
+        # charge the rest of the half hour is counted, and nothing after it fits
+        print("\n**** Cap actual charging: no record after the charge ****")
+        set_energy(range(480, 490))
+        failed |= check_idle("cap_actual_no_later_record", [], range(490, minutes_now))
+        failed |= run_cap_minutes_case("cap_actual_no_later_record", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 690, 10.0)), [(630, 650, 10), (660, 670, 10)])
+
+        # A history that starts after the dispatch says nothing about it, though it is padded back in car_charging_energy
+        print("\n**** Cap actual charging: history starting after the dispatch ****")
+        set_energy(later, first_minute=520)
+        failed |= check_idle("cap_actual_late_history", range(520, 558), range(0, 520))
+        failed |= run_cap_minutes_case("cap_actual_late_history", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 690, 10.0)), [(630, 650, 10), (660, 670, 10)])
+
+        # A reset: the minutes the energy falls across are unknown, not idle
+        print("\n**** Cap actual charging: a sensor reset ****")
+        set_energy(list(range(480, 490)) + later, resets=(500,))
+        failed |= check_idle("cap_actual_reset", range(500, 558), range(490, 500))
+
+        # A sensor in Wh is converted; one in a unit that is not energy, such as a power sensor, gives nothing to go by
+        print("\n**** Cap actual charging: sensor units ****")
+        set_energy(list(range(480, 490)) + later)
+        for record in histories["sensor.car_energy_0"]:
+            record["state"] = str(float(record["state"]) * 1000)
+            record["attributes"] = {"unit_of_measurement": "Wh"}
+        my_predbat.octopus_cap_idle = my_predbat.octopus_cap_idle_load()
+        failed |= check_idle("cap_actual_wh", range(490, 558), range(480, 490))
+        for record in histories["sensor.car_energy_0"]:
+            record["attributes"] = {"unit_of_measurement": "W"}
+        if my_predbat.octopus_cap_idle_load() is not None:
+            print("ERROR: cap_actual_units: a sensor in W should give nothing to go by")
+            failed = True
+
+        # The cap is per account: a minute is only idle when no car charged in it, and only when every car has a sensor
+        # with history - one sensor for two cars, or one with no history, could be missing the other car's charging
+        print("\n**** Cap actual charging: two cars ****")
+        my_predbat.num_cars = 2
+        set_energy(list(range(480, 490)) + later, list(range(490, 500)) + later)
+        failed |= check_idle("cap_actual_two_cars", range(500, 558), range(480, 500))
+        set_energy(list(range(480, 490)) + later)
+        if my_predbat.octopus_cap_idle is not None:
+            print("ERROR: cap_actual_two_cars: one car_charging_energy sensor for two cars should give nothing to go by")
+            failed = True
+        set_energy(list(range(480, 490)) + later, None)
+        if my_predbat.octopus_cap_idle is not None:
+            print("ERROR: cap_actual_two_cars: a car sensor with no history should give nothing to go by")
+            failed = True
+        # A second car with no Octopus Intelligent dispatches uses none of the account's cap, so it needs no sensor
+        set_energy(list(range(480, 490)) + later, slot_cars=[0])
+        failed |= check_idle("cap_actual_two_cars_one_iog", range(490, 558), range(480, 490))
+        my_predbat.num_cars = 1
+
+        # While the sensor is unavailable nothing is known, however the readings either side compare
+        print("\n**** Cap actual charging: sensor unavailable ****")
+        set_energy(list(range(480, 490)) + later)
+        stamp = (midnight_utc + timedelta(minutes=500)).strftime(time_format)
+        histories["sensor.car_energy_0"].append({"state": "unavailable", "last_updated": stamp, "attributes": {"unit_of_measurement": "kWh"}})
+        stamp = (midnight_utc + timedelta(minutes=520)).strftime(time_format)
+        histories["sensor.car_energy_0"].append({"state": "1.2", "last_updated": stamp, "attributes": {"unit_of_measurement": "kWh"}})
+        my_predbat.octopus_cap_idle = my_predbat.octopus_cap_idle_load()
+        failed |= check_idle("cap_actual_unavailable", list(range(490, 500)) + list(range(520, 558)), range(500, 520))
+
+        # Under the window billing rule the whole planned window is billed whether the car charges or not, so it is counted whole
+        print("\n**** Cap actual charging: window billing rule ****")
+        set_energy(list(range(480, 490)) + later)
+        saved_billing = my_predbat.args.get("intelligent_dispatch_billing")
+        my_predbat.args["intelligent_dispatch_billing"] = "window"
+        try:
+            failed |= run_cap_minutes_case("cap_actual_window_billing", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 690, 10.0)), [(630, 650, 10), (660, 670, 10)])
+        finally:
+            if saved_billing is None:
+                my_predbat.args.pop("intelligent_dispatch_billing", None)
+            else:
+                my_predbat.args["intelligent_dispatch_billing"] = saved_billing
+
+        # Charging slower than OCTOPUS_CAP_CHARGING_KW is taken as none, but for the minute its first step after a pause
+        # would take at that rate: 1 minute of the cap in all, so the planned 30 minutes run 1 minute over it
+        print("\n**** Cap actual charging: trickle below the threshold ****")
+        set_energy(list(range(480, 490)) + later, kw=0.3)
+        failed |= check_idle("cap_actual_trickle", range(481, 490), [480])
+        failed |= run_cap_minutes_case("cap_actual_trickle", my_predbat, slots, 1, rates_for((480, 510, 4.0), (630, 660, 4.0), (660, 690, 4.0)), [(630, 650, 4), (660, 669, 4), (669, 670, 10)])
+
+        # A completed hour, 08:00-09:00, charged 08:00-08:20 and 08:40-08:55, against a 30-minute cap: the pause still fits
+        # while the budget lasts but for its last two minutes (the first step after it, at OCTOPUS_CAP_CHARGING_KW), the
+        # budget runs out at 08:48, and both half hours stay cheap as the car charged in each inside it. The car is billed at peak
+        # for 08:48-09:00, the minutes left beyond the cap, and the plan after is over it
+        print("\n**** Cap actual charging: the budget runs out inside a completed dispatch ****")
+        slots = [dispatch((8, 0), (9, 0)), dispatch((10, 30), (10, 50))]
+        set_energy(list(range(480, 500)) + list(range(520, 535)) + later)
+        failed |= run_cap_minutes_case("cap_actual_runs_out", my_predbat, slots, 1, rates_for((480, 540, 4.0), (630, 660, 10.0)), [(630, 650, 10)])
+        over_cap = sorted(minute for minute in my_predbat.octopus_over_cap_minutes(0, slots) if minute < minutes_now)
+        if over_cap != list(range(528, 540)):
+            print("ERROR: cap_actual_runs_out: past over-cap minutes should be 528-539 but got {}".format(over_cap))
+            failed = True
+    finally:
+        my_predbat.__dict__.pop("get_history_wrapper", None)
+        for key, value in saved.items():
+            setattr(my_predbat, key, value)
+        if saved_scale is None:
+            my_predbat.__dict__.pop("car_charging_energy_scale", None)
+        else:
+            my_predbat.car_charging_energy_scale = saved_scale
+        if saved_arg is None:
+            my_predbat.args.pop("car_charging_energy", None)
+        else:
+            my_predbat.args["car_charging_energy"] = saved_arg
 
     return failed
 

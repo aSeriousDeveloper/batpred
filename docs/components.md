@@ -1737,6 +1737,7 @@ Integrates with Sunsynk (DEYE-family) hybrid inverters via the Sunsynk Connect c
 | `automatic_ignore_pv` | Boolean | No | false | `sunsynk_automatic_ignore_pv` | When `automatic` is enabled, set to `true` to prevent Sunsynk Cloud from overwriting the `pv_power` config |
 | `control_enable` | Boolean | No | true | `sunsynk_control_enable` | Allow Predbat to write charge/export schedules to the inverter. Set to `false` for monitoring only |
 | `battery_nominal_voltage` | Float | No | - | `sunsynk_battery_nominal_voltage` | Override for the battery pack's nominal voltage, only needed if it cannot be inferred from the reported charge target |
+| `sell_slots_exclusive` | Boolean | No | false | `sunsynk_sell_slots_exclusive` | Modern inverter firmware (LCD E43E and MCU2 xx89 or higher) allows for using timed sell slots. Keeps system mode as "Limited to Home" and correctly reports system load during exports. |
 
 See [Sunsynk Cloud setup](inverter-setup.md#sunsynk-cloud) for the full walkthrough, including how to run the standalone diagnostics CLI.
 

@@ -143,6 +143,7 @@ class SunsynkAPI(ComponentBase, OAuthMixin, TouScheduleMixin):
         automatic_ignore_pv=False,
         control_enable=True,
         battery_nominal_voltage=None,
+        sell_slots_exclusive=False,
         **kwargs,
     ):
         """Initialise the Sunsynk component from its resolved config args.
@@ -163,6 +164,8 @@ class SunsynkAPI(ComponentBase, OAuthMixin, TouScheduleMixin):
         self.control_enable = control_enable
         self.inverter_sn_filter = inverter_sn if isinstance(inverter_sn, list) else ([inverter_sn] if inverter_sn else [])
         self.battery_nominal_voltage = float(battery_nominal_voltage) if battery_nominal_voltage else 0.0
+        # Sell to Grid only using timed Sell slots, do not use "Selling First" System Mode
+        self.sell_slots_exclusive = sell_slots_exclusive
         self.device_list = []
         # {sn: {"equip_mode", "plant"}} from the inverter list, for every serial on the account
         self.device_roles = {}
@@ -1014,7 +1017,7 @@ class SunsynkAPI(ComponentBase, OAuthMixin, TouScheduleMixin):
             export_soc = int(export.get("soc", FREEZE_EXPORT_SOC))
             if export_soc >= FREEZE_EXPORT_SOC:
                 return self._freeze_export_state(reserve)
-            return {"behaviour": "export", "work_mode": SUNSYNK_WORKMODE["selling_first"], "grid_charge": False, "solar_sell": True, "slot_soc": export_soc, "power": int(export.get("power", 0))}
+            return {"behaviour": "export", "work_mode": SUNSYNK_WORKMODE["zero_export_ct"] if self.sell_slots_exclusive else SUNSYNK_WORKMODE["selling_first"], "grid_charge": False, "solar_sell": True, "slot_soc": export_soc, "power": int(export.get("power", 0))}
 
         if charge.get("enable"):
             charge_soc = int(charge.get("soc", 0))
@@ -1105,7 +1108,7 @@ class SunsynkAPI(ComponentBase, OAuthMixin, TouScheduleMixin):
         250 W house. The cap is what should allow it and nothing observed contradicts that,
         but it is the one leg of this resting on reasoning rather than a measurement.
         """
-        return {"behaviour": "freeze_export", "work_mode": SUNSYNK_WORKMODE["selling_first"], "grid_charge": False, "solar_sell": True, "slot_soc": int(reserve), "power": 0}
+        return {"behaviour": "freeze_export", "work_mode": SUNSYNK_WORKMODE["zero_export_ct"] if self.sell_slots_exclusive else SUNSYNK_WORKMODE["selling_first"], "grid_charge": False, "solar_sell": True, "slot_soc": int(reserve), "power": 0}
 
     def _self_use_slot(self, start_time, reserve, self_use_power):
         """Build a self-use slot holding at the reserve SOC.
